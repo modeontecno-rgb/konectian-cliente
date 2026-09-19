@@ -1,0 +1,344 @@
+name: Konectian - Compilar cliente macOS (universal)
+
+# Compilacion autonoma del cliente Konectian para macOS.
+#
+# Por que existe este workflow:
+#   El lanzador multiplataforma completo (konectian-build.yml -> flutter-build.yml)
+#   depende de workflows reutilizables anidados que devuelven "startup_failure"
+#   en este repositorio antes de que arranque cualquier job. Este workflow
+#   reproduce la MISMA receta probada de RustDesk para macOS (generacion del
+#   flutter-rust-bridge + vcpkg + build.py de Flutter macOS + create-dmg) de
+#   forma inline, sin anidar workflows reutilizables, para garantizar un binario
+#   .dmg funcional.
+#
+#   El servidor y la clave publica ya estan integrados en
+#   libs/hbb_common/src/config.rs (konectian.com), por lo que el .dmg generado
+#   se conecta a la infraestructura de Konectian directamente.
+#
+# Firma de Apple (opcional):
+#   Si estan configurados los secretos MACOS_P12_BASE64 / MACOS_P12_PASSWORD /
+#   APPLE_TEAM_ID, la app se firma y se notariza. Si NO estan configurados, el
+#   workflow NO falla: genera un .dmg SIN firmar (Gatekeeper pedira al usuario
+#   abrirlo con clic derecho -> Abrir la primera vez). Consulta la guia
+#   GUIA-FIRMA-APPLE.md para activar la firma.
+#
+# Ejecutar manualmente: Actions -> "Konectian - Compilar cliente macOS (universal)"
+# -> Run workflow. El .dmg queda como Artifact descargable de la ejecucion y, si
+# hay una etiqueta v* publicada, se adjunta tambien al GitHub Release.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "flutter/**"
+      - ".github/workflows/konectian-macos.yml"
+
+env:
+  # macOS/iOS requieren Rust 1.81 (no 1.75) por el toolchain de Apple.
+  MAC_RUST_VERSION: "1.81"
+  FLUTTER_VERSION: "3.24.5"
+  LLVM_VERSION: "15.0.6"
+  CARGO_EXPAND_VERSION: "1.0.95"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VERSION: "1.5.0"
+  UPLOAD_ARTIFACT: "true"
+  # Se exponen los secretos opcionales de firma como variables de entorno para
+  # poder condicionar los pasos con `if: env.MACOS_P12_BASE64 != null`.
+  MACOS_P12_BASE64: ${{ secrets.MACOS_P12_BASE64 }}
+  MACOS_P12_PASSWORD: ${{ secrets.MACOS_P12_PASSWORD }}
+  APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+  MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+  MACOS_NOTARIZE_JSON: ${{ secrets.MACOS_NOTARIZE_JSON }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Generar el artefacto flutter-rust-bridge (bridge por defecto, Flutter 3.22.3)
+  #    Identico al generate-bridge de konectian-linux.yml (copiado de bridge.yml).
+  # ---------------------------------------------------------------------------
+  generate-bridge:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get install ca-certificates -y
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            curl \
+            gcc \
+            git \
+            g++ \
+            libclang-dev \
+            libgtk-3-dev \
+            llvm-dev \
+            nasm \
+            ninja-build \
+            pkg-config \
+            wget
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.75"
+          targets: x86_64-unknown-linux-gnu
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: bridge-ubuntu-22.04
+
+      - name: Cache Bridge
+        id: cache-bridge
+        uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3
+        with:
+          path: /tmp/flutter_rust_bridge
+          key: bridge-3.22.3
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: "3.22.3"
+          cache: true
+
+      - name: Install flutter rust bridge deps
+        shell: bash
+        run: |
+          cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
+          cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
+          # Flutter 3.22.3 por defecto: extended_text 14 necesita un Dart mas nuevo, se baja para resolver.
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          pushd flutter && flutter pub get && popd
+
+      - name: Run flutter rust bridge
+        run: |
+          ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bridge-artifact
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
+
+  # ---------------------------------------------------------------------------
+  # 2) Compilar el cliente macOS (Apple Silicon, aarch64). Copiado de
+  #    flutter-build.yml (build-for-macOS) con la firma condicionada a secretos
+  #    y un .dmg SIN firmar como resultado por defecto.
+  # ---------------------------------------------------------------------------
+  build-macos:
+    needs: [generate-bridge]
+    name: build konectian macos aarch64
+    runs-on: macos-14
+    env:
+      arch: aarch64
+      target: aarch64-apple-darwin
+      vcpkg_triplet: arm64-osx
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      # --- Firma opcional: solo si el secreto MACOS_P12_BASE64 esta definido ---
+      - name: Import the codesign cert
+        if: env.MACOS_P12_BASE64 != null
+        uses: apple-actions/import-codesign-certs@253ddeeac23f2bdad1646faac5c8c2832e800071 # v1
+        with:
+          p12-file-base64: ${{ secrets.MACOS_P12_BASE64 }}
+          p12-password: ${{ secrets.MACOS_P12_PASSWORD }}
+          keychain: konectian
+
+      - name: Check sign and import sign key
+        if: env.MACOS_P12_BASE64 != null
+        run: |
+          security default-keychain -s konectian.keychain
+          security find-identity -v
+
+      - name: Import notarize key
+        if: env.MACOS_P12_BASE64 != null && env.MACOS_NOTARIZE_JSON != null
+        uses: timheuer/base64-to-file@adaa40c0c581f276132199d4cf60afa07ce60eac # v1.2
+        with:
+          fileName: konectian.json
+          fileDir: ${{ github.workspace }}
+          encodedString: ${{ secrets.MACOS_NOTARIZE_JSON }}
+
+      - name: Install rcodesign tool
+        if: env.MACOS_P12_BASE64 != null && env.MACOS_NOTARIZE_JSON != null
+        shell: bash
+        run: |
+          pushd /tmp
+          wget https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.22.0/apple-codesign-0.22.0-macos-universal.tar.gz
+          tar -zxvf apple-codesign-0.22.0-macos-universal.tar.gz
+          mv apple-codesign-0.22.0-macos-universal/rcodesign /usr/local/bin
+          popd
+
+      - name: Install build runtime
+        run: |
+          brew install llvm create-dmg
+          if command -v pkg-config &>/dev/null; then
+              echo "pkg-config is already installed"
+          else
+              brew install pkg-config
+          fi
+
+      - name: Install NASM
+        run: |
+          wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
+          unzip nasm-2.16.03-macosx.zip
+          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
+          nasm --version
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          if [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]]; then
+            git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
+
+      - name: Workaround for flutter issue
+        shell: bash
+        run: |
+          cd "$(dirname "$(which flutter)")"
+          # https://github.com/flutter/flutter/issues/133533
+          sed -i -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
+          grep -n '_setFramesEnabledState(false);' ../packages/flutter/lib/src/scheduler/binding.dart
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.MAC_RUST_VERSION }}
+          targets: ${{ env.target }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: macos-14
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        run: |
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ env.vcpkg_triplet }}-rel-out.log" || true
+
+      - name: Show version information (Rust, cargo, Clang)
+        shell: bash
+        run: |
+          clang --version || true
+          rustup -V
+          rustup toolchain list
+          rustup default
+          cargo -V
+          rustc -V
+
+      - name: Build konectian
+        run: |
+          MIN_MACOS_VERSION="12.3"
+          sed -i -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
+          sed -i -e "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" flutter/macos/Podfile
+          sed -i -e "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"${MIN_MACOS_VERSION}\"/" Cargo.toml
+          sed -i -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN_MACOS_VERSION};/" flutter/macos/Runner.xcodeproj/project.pbxproj
+          ./build.py --flutter --hwcodec --unix-file-copy-paste --screencapturekit
+
+      - name: Create unsigned dmg
+        if: env.UPLOAD_ARTIFACT == 'true' && env.MACOS_P12_BASE64 == null
+        run: |
+          CREATE_DMG="$(command -v create-dmg)"
+          CREATE_DMG="$(readlink -f "$CREATE_DMG")"
+          sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
+          # El bundle compilado mantiene el nombre de producto "RustDesk.app"
+          # (nombre interno del proyecto Flutter); el DMG de salida se nombra Konectian.
+          create-dmg --icon "RustDesk.app" 200 190 --hide-extension "RustDesk.app" --window-size 800 400 --app-drop-link 600 185 konectian-${{ env.VERSION }}-macos-universal.dmg ./flutter/build/macos/Build/Products/Release/RustDesk.app
+
+      - name: Codesign app and create signed dmg
+        if: env.UPLOAD_ARTIFACT == 'true' && env.MACOS_P12_BASE64 != null
+        run: |
+          CREATE_DMG="$(command -v create-dmg)"
+          CREATE_DMG="$(readlink -f "$CREATE_DMG")"
+          sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
+          security default-keychain -s konectian.keychain
+          security unlock-keychain -p ${{ secrets.MACOS_P12_PASSWORD }} konectian.keychain
+          rm -rf *.dmg || true
+          bash ./.github/scripts/sign-macos-app.sh \
+            ./flutter/build/macos/Build/Products/Release/RustDesk.app \
+            ${{ secrets.MACOS_CODESIGN_IDENTITY }} \
+            ./flutter/macos/Runner/Release.entitlements
+          create-dmg --icon "RustDesk.app" 200 190 --hide-extension "RustDesk.app" --window-size 800 400 --app-drop-link 600 185 konectian-${{ env.VERSION }}-macos-universal.dmg ./flutter/build/macos/Build/Products/Release/RustDesk.app
+          codesign --force --options runtime -s ${{ secrets.MACOS_CODESIGN_IDENTITY }} --deep --strict konectian-${{ env.VERSION }}-macos-universal.dmg -vvv
+          # Notarizar solo si se aporto la clave de notarizacion.
+          if [ -f "${{ github.workspace }}/konectian.json" ]; then
+            rcodesign notary-submit --api-key-path ${{ github.workspace }}/konectian.json --staple konectian-${{ env.VERSION }}-macos-universal.dmg
+          fi
+
+      - name: Upload macOS dmg
+        if: env.UPLOAD_ARTIFACT == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: konectian-${{ env.VERSION }}-macos-universal-dmg
+          path: konectian-${{ env.VERSION }}-macos-universal.dmg
+
+      # --- Publicar en el GitHub Release si la ejecucion viene de una etiqueta v* ---
+      - name: Preparar activo del Release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # El enlace de descarga de la web espera el nombre EXACTO (sin extension).
+          cp konectian-${{ env.VERSION }}-macos-universal.dmg konectian-${{ env.VERSION }}-macos-universal-dmg
+
+      - name: Subir al GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            konectian-${{ env.VERSION }}-macos-universal-dmg
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

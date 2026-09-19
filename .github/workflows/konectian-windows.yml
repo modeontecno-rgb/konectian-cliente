@@ -19,10 +19,16 @@ name: Konectian - Compilar cliente Windows (x86_64)
 #   attached as a downloadable run Artifact.
 #
 # Run it manually: Actions -> "Konectian - Compilar cliente Windows (x86_64)"
-# -> Run workflow.
+# -> Run workflow. Ademas, si la ejecucion viene de una etiqueta v*, el .exe se
+# adjunta automaticamente al GitHub Release correspondiente.
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "flutter/**"
+      - ".github/workflows/konectian-windows.yml"
 
 env:
   RUST_VERSION: "1.75"
@@ -291,3 +297,22 @@ jobs:
         with:
           name: konectian-${{ env.VERSION }}-windows-${{ env.arch }}-exe
           path: ./SignOutput/konectian-*.exe
+
+      # --- Publicar en el GitHub Release si la ejecucion viene de una etiqueta v* ---
+      - name: Preparar activo del Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          # El enlace de descarga de la web espera el nombre EXACTO (sin extension).
+          EXE=$(ls ./SignOutput/konectian-*.exe | head -n1)
+          cp "$EXE" konectian-${{ env.VERSION }}-windows-x86_64-exe
+
+      - name: Subir al GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            konectian-${{ env.VERSION }}-windows-x86_64-exe
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

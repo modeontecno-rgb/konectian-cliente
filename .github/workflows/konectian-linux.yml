@@ -16,10 +16,16 @@ name: Konectian - Compilar cliente Linux (x86_64)
 #
 # Run it manually: Actions -> "Konectian - Compilar cliente Linux (x86_64)"
 # -> Run workflow. The .deb and .rpm packages are attached as downloadable
-# Artifacts of the run.
+# Artifacts of the run. Ademas, si la ejecucion viene de una etiqueta v*, los
+# paquetes se adjuntan automaticamente al GitHub Release correspondiente.
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "flutter/**"
+      - ".github/workflows/konectian-linux.yml"
 
 env:
   RUST_VERSION: "1.75"
@@ -340,3 +346,21 @@ jobs:
         with:
           name: konectian-${{ env.VERSION }}-x86_64-rpm
           path: rustdesk-*.rpm
+
+      # --- Publicar en el GitHub Release si la ejecucion viene de una etiqueta v* ---
+      - name: Preparar activo del Release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # El enlace de descarga de la web espera el nombre EXACTO (sin extension).
+          DEB=$(ls rustdesk-*.deb | head -n1)
+          cp "$DEB" konectian-${{ env.VERSION }}-linux-x86_64-deb
+
+      - name: Subir al GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            konectian-${{ env.VERSION }}-linux-x86_64-deb
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

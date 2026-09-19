@@ -19,10 +19,16 @@ name: Konectian - Compilar cliente Android (APK)
 #   APK. Each ABI's APK is attached as a downloadable run Artifact.
 #
 # Run it manually: Actions -> "Konectian - Compilar cliente Android (APK)"
-# -> Run workflow.
+# -> Run workflow. Ademas, si la ejecucion viene de una etiqueta v*, el APK
+# aarch64 se adjunta automaticamente al GitHub Release correspondiente.
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "flutter/**"
+      - ".github/workflows/konectian-android.yml"
 
 env:
   RUST_VERSION: "1.75"
@@ -327,3 +333,20 @@ jobs:
         with:
           name: konectian-${{ env.VERSION }}-android-${{ matrix.job.arch }}-apk
           path: ./konectian-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+
+      # --- Publicar en el GitHub Release (solo aarch64) si la ejecucion viene de una etiqueta v* ---
+      - name: Preparar activo del Release
+        if: startsWith(github.ref, 'refs/tags/') && matrix.job.arch == 'aarch64'
+        run: |
+          # El enlace de descarga de la web espera el nombre EXACTO (sin extension).
+          cp ./konectian-${{ env.VERSION }}-${{ matrix.job.arch }}.apk konectian-${{ env.VERSION }}-android-aarch64-apk
+
+      - name: Subir al GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') && matrix.job.arch == 'aarch64'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            konectian-${{ env.VERSION }}-android-aarch64-apk
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
