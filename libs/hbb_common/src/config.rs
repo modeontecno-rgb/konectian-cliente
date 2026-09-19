@@ -114,7 +114,7 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["konectian.com"];
+pub const RENDEZVOUS_SERVERS: &[&str] = &["motor.konectian.com", "178.105.251.66"];
 pub const RS_PUB_KEY: &str = "M6ihVe7L2lEqm3tuhqngoBGmS9rsf6FdciNdwV1RbI4=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
